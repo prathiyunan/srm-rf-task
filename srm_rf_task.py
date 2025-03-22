@@ -1,88 +1,156 @@
-import gymnasium as gym
-import numpy as np
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 import random
-from collections import defaultdict
+import gym
+import numpy as np
+from collections import deque
+from keras.models import Model, load_model
+from keras.layers import Input, Dense
+from keras.optimizers import Adam, RMSprop
 
-# Initialize Blackjack environment
-env = gym.make('Blackjack-v1', sab=True)
 
-class MonteCarloAgent:
-    def __init__(self, actions, epsilon=1.0, epsilon_decay=0.9999):
-        self.q_table = defaultdict(lambda: np.zeros(len(actions)))  # Q-values
-        self.returns = defaultdict(list)  # Stores returns for averaging
-        self.epsilon = epsilon  # Exploration rate
-        self.epsilon_decay = epsilon_decay  # Decay rate
-        self.actions = actions  # 0: Stick, 1: Hit
+def OurModel(input_shape, action_space):
+    X_input = Input(input_shape)
 
-    def choose_action(self, state):
-        """Epsilon-greedy policy for action selection."""
-        if random.uniform(0, 1) < self.epsilon:
-            return random.choice(self.actions)  # Explore
-        return np.argmax(self.q_table[state])  # Exploit
+    # 'Dense' is the basic form of a neural network layer
+    # Input Layer of state size(4) and Hidden Layer with 512 nodes
+    X = Dense(512, input_shape=input_shape, activation="relu", kernel_initializer='he_uniform')(X_input)
 
-    def update_q_table(self, episode):
-        """Monte Carlo update: Compute returns and update Q-table."""
-        G = 0  # Total return (sum of rewards)
-        visited_states = set()
+    # Hidden layer with 256 nodes
+    X = Dense(256, activation="relu", kernel_initializer='he_uniform')(X)
+    
+    # Hidden layer with 64 nodes
+    X = Dense(64, activation="relu", kernel_initializer='he_uniform')(X)
 
-        # Iterate through episode in reverse (backward pass)
-        for state, action, reward in reversed(episode):
-            G += reward  # Accumulate reward
-            if (state, action) not in visited_states:  # First-visit MC
-                self.returns[(state, action)].append(G)
-                self.q_table[state][action] = np.mean(self.returns[(state, action)])
-                visited_states.add((state, action))
+    # Output Layer with # of actions: 2 nodes (left, right)
+    X = Dense(action_space, activation="linear", kernel_initializer='he_uniform')(X)
 
-        self.epsilon *= self.epsilon_decay  # Reduce exploration
+    model = Model(inputs = X_input, outputs = X, name='CartPole DQN model')
+    model.compile(loss="mse", optimizer=RMSprop(lr=0.00025, rho=0.95, epsilon=0.01), metrics=["accuracy"])
 
-def train_blackjack(agent, env, episodes=100000):
-    """Train agent using Monte Carlo method."""
-    for episode_num in range(episodes):
-        state, _ = env.reset()
-        episode = []
-        done = False
+    model.summary()
+    return model
 
-        # Generate episode
-        while not done:
-            action = agent.choose_action(state)
-            next_state, reward, done, _, _ = env.step(action)
-            episode.append((state, action, reward))
-            state = next_state
+class DQNAgent:
+    def _init_(self):
+        self.env = gym.make('CartPole-v1')
+        # by default, CartPole-v1 has max episode steps = 500
+        self.state_size = self.env.observation_space.shape[0]
+        self.action_size = self.env.action_space.n
+        self.EPISODES = 1000
+        self.memory = deque(maxlen=2000)
+        
+        self.gamma = 0.95    # discount rate
+        self.epsilon = 1.0  # exploration rate
+        self.epsilon_min = 0.001
+        self.epsilon_decay = 0.999
+        self.batch_size = 128
+        self.train_start = 1000
 
-        agent.update_q_table(episode)  # Update Q-values
+        # create main model
+        self.model = OurModel(input_shape=(self.state_size,), action_space = self.action_size)
 
-        if episode_num % 10000 == 0:
-            print(f"Episode {episode_num}/{episodes}, Epsilon: {agent.epsilon:.4f}")
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+        if len(self.memory) > self.train_start:
+            if self.epsilon > self.epsilon_min:
+                self.epsilon *= self.epsilon_decay
 
-    print("Training completed!")
-
-def evaluate_blackjack(agent, env, episodes=10000):
-    """Evaluate trained agent's win rate."""
-    wins, losses, draws = 0, 0, 0
-
-    for _ in range(episodes):
-        state, _ = env.reset()
-        done = False
-
-        while not done:
-            action = np.argmax(agent.q_table[state])  # Always exploit policy
-            state, reward, done, _, _ = env.step(action)
-
-        if reward > 0:
-            wins += 1
-        elif reward < 0:
-            losses += 1
+    def act(self, state):
+        if np.random.random() <= self.epsilon:
+            return random.randrange(self.action_size)
         else:
-            draws += 1
+            return np.argmax(self.model.predict(state))
 
-    print(f"Results after {episodes} games:")
-    print(f"Wins: {wins}, Losses: {losses}, Draws: {draws}")
-    print(f"Win Rate: {wins / episodes:.2%}")
+    def replay(self):
+        if len(self.memory) < self.train_start:
+            return
+        # Randomly sample minibatch from the memory
+        minibatch = random.sample(self.memory, min(len(self.memory), self.batch_size))
 
-# Create agent and train it
-actions = [0, 1]  # 0: Stick, 1: Hit
-agent = MonteCarloAgent(actions)
-train_blackjack(agent, env)
+        state = np.zeros((self.batch_size, self.state_size))
+        next_state = np.zeros((self.batch_size, self.state_size))
+        action, reward, done = [], [], []
 
-# Evaluate trained agent
-evaluate_blackjack(agent, env)
+        # do this before prediction
+        # for speedup, this could be done on the tensor level
+        # but easier to understand using a loop
+        for i in range(self.batch_size):
+            state[i] = minibatch[i][0]
+            action.append(minibatch[i][1])
+            reward.append(minibatch[i][2])
+            next_state[i] = minibatch[i][3]
+            done.append(minibatch[i][4])
+
+        # do batch prediction to save speed
+        target = self.model.predict(state)
+        target_next = self.model.predict(next_state)
+
+        for i in range(self.batch_size):
+            # correction on the Q value for the action used
+            if done[i]:
+                target[i][action[i]] = reward[i]
+            else:
+                # Standard - DQN
+                # DQN chooses the max Q value among next actions
+                # selection and evaluation of action is on the target Q Network
+                # Q_max = max_a' Q_target(s', a')
+                target[i][action[i]] = reward[i] + self.gamma * (np.amax(target_next[i]))
+
+        # Train the Neural Network with batches
+        self.model.fit(state, target, batch_size=self.batch_size, verbose=0)
+
+
+    def load(self, name):
+        self.model = load_model(name)
+
+    def save(self, name):
+        self.model.save(name)
+            
+    def run(self):
+        for e in range(self.EPISODES):
+            state = self.env.reset()
+            state = np.reshape(state, [1, self.state_size])
+            done = False
+            i = 0
+            while not done:
+                self.env.render()
+                action = self.act(state)
+                next_state, reward, done, _ = self.env.step(action)
+                next_state = np.reshape(next_state, [1, self.state_size])
+                if not done or i == self.env._max_episode_steps-1:
+                    reward = reward
+                else:
+                    reward = -100
+                self.remember(state, action, reward, next_state, done)
+                state = next_state
+                i += 1
+                if done:                   
+                    print("episode: {}/{}, score: {}, e: {:.2}".format(e, self.EPISODES, i, self.epsilon))
+                    if i == 500:
+                        print("Saving trained model as cartpole-dqn.h5")
+                        self.save("cartpole-dqn.h5")
+                    break
+                self.replay()
+
+    def test(self):
+        self.load(self.Model_name)
+        for e in range(self.EPISODES):
+            state = self.env.reset()
+            state = np.reshape(state, [1, self.state_size])
+            done = False
+            i = 0
+            while not done:
+                self.env.render()
+                action = np.argmax(self.model.predict(state))
+                next_state, reward, done, _ = self.env.step(action)
+                state = np.reshape(next_state, [1, self.state_size])
+                i += 1
+                if done:
+                    print("episode: {}/{}, score: {}".format(e, self.EPISODES, i))
+                    break
+
+if _name_ == "_main_":
+    agent = DQNAgent()
+    agent.run()
+    #agent.test()
