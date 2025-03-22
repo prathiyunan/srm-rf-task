@@ -1,103 +1,88 @@
-import gym
-import random
+import gymnasium as gym
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from collections import deque
+import random
+from collections import defaultdict
 
-# Define the neural network for approximating the Q-value function
-class DQN(nn.Module):
-    def __init__(self, state_size, action_size):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, 24)
-        self.fc2 = nn.Linear(24, 24)
-        self.fc3 = nn.Linear(24, action_size)
-    
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+# Initialize Blackjack environment
+env = gym.make('Blackjack-v1', sab=True)
 
-# Define the agent that interacts with the environment
-class Agent:
-    def __init__(self, state_size, action_size):
-        self.state_size = state_size
-        self.action_size = action_size
-        self.memory = deque(maxlen=2000)  
-        self.gamma = 0.95   
-        self.epsilon = 1.0   
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995
-        self.learning_rate = 0.001
-        self.batch_size = 32
+class MonteCarloAgent:
+    def __init__(self, actions, epsilon=1.0, epsilon_decay=0.9999):
+        self.q_table = defaultdict(lambda: np.zeros(len(actions)))  # Q-values
+        self.returns = defaultdict(list)  # Stores returns for averaging
+        self.epsilon = epsilon  # Exploration rate
+        self.epsilon_decay = epsilon_decay  # Decay rate
+        self.actions = actions  # 0: Stick, 1: Hit
 
-        # Use GPU if available
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = DQN(state_size, action_size).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        self.loss_fn = nn.MSELoss()
+    def choose_action(self, state):
+        """Epsilon-greedy policy for action selection."""
+        if random.uniform(0, 1) < self.epsilon:
+            return random.choice(self.actions)  # Explore
+        return np.argmax(self.q_table[state])  # Exploit
 
-    # Store experience in memory
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
+    def update_q_table(self, episode):
+        """Monte Carlo update: Compute returns and update Q-table."""
+        G = 0  # Total return (sum of rewards)
+        visited_states = set()
 
-    # Choose an action using an epsilon-greedy policy
-    def act(self, state):
-        if np.random.rand() <= self.epsilon:
-            return random.randrange(self.action_size)
-        # Convert state to tensor and predict Q-values
-        state_tensor = torch.FloatTensor(state).to(self.device)
-        with torch.no_grad():
-            q_values = self.model(state_tensor)
-        return np.argmax(q_values.cpu().numpy())
+        # Iterate through episode in reverse (backward pass)
+        for state, action, reward in reversed(episode):
+            G += reward  # Accumulate reward
+            if (state, action) not in visited_states:  # First-visit MC
+                self.returns[(state, action)].append(G)
+                self.q_table[state][action] = np.mean(self.returns[(state, action)])
+                visited_states.add((state, action))
 
-    # Train the model using a random batch of experiences from memory
-    def replay(self):
-        if len(self.memory) < self.batch_size:
-            return
-        minibatch = random.sample(self.memory, self.batch_size)
-        for state, action, reward, next_state, done in minibatch:
-            state_tensor = torch.FloatTensor(state).to(self.device)
-            next_state_tensor = torch.FloatTensor(next_state).to(self.device)
-            target = reward
-            if not done:
-                # Bellman equation: Q_target = r + gamma * max_a' Q(next_state, a')
-                target = reward + self.gamma * torch.max(self.model(next_state_tensor)).item()
-            # Compute current Q-value for the chosen action
-            current_q = self.model(state_tensor)[action]
-            target_tensor = torch.tensor(target).to(self.device)
-            loss = self.loss_fn(current_q, target_tensor)
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-        # Decay the exploration rate
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        self.epsilon *= self.epsilon_decay  # Reduce exploration
 
-# Main loop to train the agent in the Cart-Pole environment
-if __name__ == "__main__":
-    env = gym.make("CartPole-v1")
-    state_size = env.observation_space.shape[0]  
-    action_size = env.action_space.n
-    agent = Agent(state_size, action_size)
-    episodes = 500
+def train_blackjack(agent, env, episodes=100000):
+    """Train agent using Monte Carlo method."""
+    for episode_num in range(episodes):
+        state, _ = env.reset()
+        episode = []
+        done = False
 
-    for e in range(episodes):
-        state = env.reset()
-        state = np.reshape(state, [1, state_size])
-        for time in range(500):
-            # Uncomment below to render the environment (slows down training)
-            # env.render()
-            action = agent.act(state)
-            next_state, reward, done, _ = env.step(action)
-            # Penalize if the episode ends early
-            reward = reward if not done else -10
-            next_state = np.reshape(next_state, [1, state_size])
-            agent.remember(state, action, reward, next_state, done)
+        # Generate episode
+        while not done:
+            action = agent.choose_action(state)
+            next_state, reward, done, _, _ = env.step(action)
+            episode.append((state, action, reward))
             state = next_state
-            if done:
-                print(f"Episode: {e+1}/{episodes}, Score: {time}, Epsilon: {agent.epsilon:.2f}")
-                break
-            # Train the agent with the experience of the current step
-            agent.replay()
+
+        agent.update_q_table(episode)  # Update Q-values
+
+        if episode_num % 10000 == 0:
+            print(f"Episode {episode_num}/{episodes}, Epsilon: {agent.epsilon:.4f}")
+
+    print("Training completed!")
+
+def evaluate_blackjack(agent, env, episodes=10000):
+    """Evaluate trained agent's win rate."""
+    wins, losses, draws = 0, 0, 0
+
+    for _ in range(episodes):
+        state, _ = env.reset()
+        done = False
+
+        while not done:
+            action = np.argmax(agent.q_table[state])  # Always exploit policy
+            state, reward, done, _, _ = env.step(action)
+
+        if reward > 0:
+            wins += 1
+        elif reward < 0:
+            losses += 1
+        else:
+            draws += 1
+
+    print(f"Results after {episodes} games:")
+    print(f"Wins: {wins}, Losses: {losses}, Draws: {draws}")
+    print(f"Win Rate: {wins / episodes:.2%}")
+
+# Create agent and train it
+actions = [0, 1]  # 0: Stick, 1: Hit
+agent = MonteCarloAgent(actions)
+train_blackjack(agent, env)
+
+# Evaluate trained agent
+evaluate_blackjack(agent, env)
